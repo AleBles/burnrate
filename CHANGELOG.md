@@ -15,6 +15,13 @@
   `<server>_<tool>` names, which the shared MCP pipeline did not recognize.
   The provider now normalizes these to the canonical `mcp__<server>__<tool>`
   form so MCP breakdowns and `optimize` work correctly. Closes #308.
+- **Mangled project names in dashboard.** The By Project and Top Sessions
+  panels decoded slugs by splitting on `-`, which broke directory names
+  containing dashes or dots (e.g. `my-project` rendered as `my/project`).
+  Now uses the real project path instead. Closes #196.
+- **Cursor undated bubble rows misattributed to Today.** Bubble rows without
+  a `createdAt` timestamp were defaulting to the current date, inflating
+  Today's spend. Now skipped at both the SQL and application level.
 
 ## 0.9.8 - 2026-05-10
 
