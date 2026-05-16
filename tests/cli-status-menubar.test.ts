@@ -55,16 +55,21 @@ describe('codeburn status --format menubar-json', () => {
       const projectDir = join(home, '.claude', 'projects', 'myapp')
       await mkdir(projectDir, { recursive: true })
 
-      const today = new Date()
-      const ymd = `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, '0')}-${String(today.getUTCDate()).padStart(2, '0')}`
+      const now = new Date()
+      const h = now.getUTCHours()
+      const base = h >= 2 ? new Date(now.getTime() - 2 * 3600_000) : new Date(now.getTime() - h * 3600_000 - 60_000)
+      const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts3 = new Date(base.getTime() + 120_000).toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts4 = new Date(base.getTime() + 180_000).toISOString().replace(/\.\d+Z$/, 'Z')
 
       await writeFile(
         join(projectDir, 'session.jsonl'),
         [
-          userLine('s1', `${ymd}T10:00:00Z`),
-          assistantLine('s1', `${ymd}T10:01:00Z`, 'msg-1'),
-          userLine('s1', `${ymd}T11:00:00Z`),
-          assistantLine('s1', `${ymd}T11:01:00Z`, 'msg-2'),
+          userLine('s1', ts1),
+          assistantLine('s1', ts2, 'msg-1'),
+          userLine('s1', ts3),
+          assistantLine('s1', ts4, 'msg-2'),
         ].join('\n'),
       )
 
