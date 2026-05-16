@@ -117,4 +117,56 @@ describe('readSessionLines', () => {
     await gen.next()
     await gen.return(undefined)
   })
+
+  it('reads from startByteOffset, yielding only lines after the offset', async () => {
+    const content = 'line1\nline2\nline3\n'
+    const p = await tmpPath(content)
+    const offset = Buffer.byteLength('line1\n')
+    const lines: string[] = []
+    for await (const line of readSessionLines(p, undefined, { startByteOffset: offset })) {
+      lines.push(line)
+    }
+    expect(lines).toEqual(['line2', 'line3'])
+  })
+
+  it('byteOffsetTracker tracks position after last complete newline', async () => {
+    const content = 'aaa\nbbb\nccc\n'
+    const p = await tmpPath(content)
+    const tracker = { lastCompleteLineOffset: 0 }
+    const lines: string[] = []
+    for await (const line of readSessionLines(p, undefined, { byteOffsetTracker: tracker })) {
+      lines.push(line)
+    }
+    expect(lines).toEqual(['aaa', 'bbb', 'ccc'])
+    expect(tracker.lastCompleteLineOffset).toBe(Buffer.byteLength(content))
+  })
+
+  it('byteOffsetTracker accounts for startByteOffset', async () => {
+    const content = 'line1\nline2\nline3\n'
+    const p = await tmpPath(content)
+    const offset = Buffer.byteLength('line1\n')
+    const tracker = { lastCompleteLineOffset: 0 }
+    for await (const _line of readSessionLines(p, undefined, { startByteOffset: offset, byteOffsetTracker: tracker })) {}
+    expect(tracker.lastCompleteLineOffset).toBe(Buffer.byteLength(content))
+  })
+
+  it('byteOffsetTracker excludes trailing partial line (no final newline)', async () => {
+    const content = 'line1\nline2\npartial'
+    const p = await tmpPath(content)
+    const tracker = { lastCompleteLineOffset: 0 }
+    for await (const _line of readSessionLines(p, undefined, { byteOffsetTracker: tracker })) {}
+    expect(tracker.lastCompleteLineOffset).toBe(Buffer.byteLength('line1\nline2\n'))
+  })
+
+  it('byteOffsetTracker updates for skipped lines too', async () => {
+    const content = 'skip-me\nkeep-me\n'
+    const p = await tmpPath(content)
+    const tracker = { lastCompleteLineOffset: 0 }
+    const lines: string[] = []
+    for await (const line of readSessionLines(p, head => head.includes('skip-me'), { byteOffsetTracker: tracker })) {
+      lines.push(line)
+    }
+    expect(lines).toEqual(['keep-me'])
+    expect(tracker.lastCompleteLineOffset).toBe(Buffer.byteLength(content))
+  })
 })

@@ -83,6 +83,7 @@ export type ParsedApiCall = {
   timestamp: string
   bashCommands: string[]
   deduplicationKey: string
+  cacheCreationOneHourTokens?: number
 }
 
 export type TaskCategory =

@@ -71,6 +71,8 @@ export type SessionLine = string | Buffer
 type ReadSessionLinesOptions = {
   largeLineAsBuffer?: boolean
   largeLineThresholdBytes?: number
+  startByteOffset?: number
+  byteOffsetTracker?: { lastCompleteLineOffset: number }
 }
 
 export function readSessionLines(
@@ -102,9 +104,10 @@ export async function* readSessionLines(
     return
   }
 
-  // Raw Buffers — no encoding. This avoids readline's ConsString trees
-  // which OOM on V8 when regex-flattening 100 MB+ lines.
-  const stream = createReadStream(filePath)
+  const stream = createReadStream(
+    filePath,
+    options.startByteOffset !== undefined ? { start: options.startByteOffset } : undefined,
+  )
   const SKIP_HEAD = 2048
   const largeLineThreshold = options.largeLineThresholdBytes ?? LARGE_STREAM_LINE_BYTES
   const formatLine = (buf: Buffer, lineLen: number, head?: string): SessionLine => {
@@ -115,6 +118,8 @@ export async function* readSessionLines(
   let len = 0
   let skipping = false
   let headChecked = false
+  let chunkBase = options.startByteOffset ?? 0
+  const tracker = options.byteOffsetTracker
 
   try {
     for await (const raw of stream) {
@@ -128,6 +133,7 @@ export async function* readSessionLines(
           if (nl === -1) {
             pos = chunk.length
           } else {
+            if (tracker) tracker.lastCompleteLineOffset = chunkBase + nl + 1
             skipping = false
             pos = nl + 1
           }
@@ -140,6 +146,7 @@ export async function* readSessionLines(
             len += nl - pos
           }
           pos = nl + 1
+          if (tracker) tracker.lastCompleteLineOffset = chunkBase + pos
 
           if (len === 0) {
             parts = []
@@ -183,6 +190,7 @@ export async function* readSessionLines(
           }
         }
       }
+      chunkBase += chunk.length
     }
 
     if (!skipping && len > 0) {
