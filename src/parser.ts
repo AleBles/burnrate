@@ -1,10 +1,11 @@
 import { lstat, readFile, readdir, stat } from 'fs/promises'
-import { basename, join, resolve } from 'path'
+import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, getShortModelName } from './models.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
 import { flushCodexCache } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
+import { getDesktopSessionsDir } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
 import {
   type CachedCall,
@@ -51,29 +52,64 @@ function projectNameFromPath(projectPath: string, fallback: string): string {
   return normalized.split('/').filter(Boolean).pop() ?? fallback
 }
 
+
+// Returns true for sessions whose canonical project key must NOT be derived
+// from the cwd. Cowork sessions come in two flavours:
+//   1. Local-mode: cwd is an ephemeral per-session outputs/ dir inside the
+//      desktop sessions directory (detected by checking the cwd).
+//   2. Container-mode: the session runs inside a Docker container so cwd is
+//      something like /sessions/<adjective-name> — not a real path on the host.
+//      We detect these by checking the JSONL file path instead: if the file
+//      lives inside the desktop sessions directory, the cwd is container-local
+//      and must not become the canonical project key.
+// In both cases the grouping key comes from the Cowork space name resolved in
+// claude.ts::discoverSessions().
+function isCoworkSession(cwd: string, filePath: string): boolean {
+  const base = resolve(getDesktopSessionsDir())
+  const inBase = (p: string) => p.startsWith(base + sep) || p.startsWith(base + '/')
+  return inBase(resolve(cwd)) || inBase(resolve(filePath))
+}
+
 async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
   const trimmed = cwd.trim()
   if (!trimmed) return { path: cwd, isWorktree: false }
 
-  const gitEntry = join(trimmed, '.git')
-  const entryStat = await lstat(gitEntry).catch(() => null)
-  if (!entryStat) return { path: cwd, isWorktree: false }
-  if (entryStat.isDirectory()) return { path: cwd, isWorktree: false }
-  if (!entryStat.isFile()) return { path: cwd, isWorktree: false }
+  // Walk up the directory tree to find the nearest .git entry. This handles
+  // three cases: (1) cwd IS the repo root (.git is a directory), (2) cwd is a
+  // git worktree (.git is a file pointing back to the main repo), (3) cwd is a
+  // subdirectory of a repo — we resolve up to the repo root so subdirectory
+  // sessions group with the rest of the project even when the subdir no longer
+  // exists on disk.
+  // Guard against foreign paths (e.g. a Windows path recorded on a machine
+  // that now runs macOS): only walk paths that look like absolute paths on the
+  // current platform. A relative or foreign-format path cannot be walked on
+  // the current filesystem without risking false positives.
+  const isAbsoluteOnCurrentPlatform = process.platform === 'win32'
+    ? /^[a-zA-Z]:[/\\]/.test(trimmed)
+    : trimmed.startsWith('/')
+  if (!isAbsoluteOnCurrentPlatform) return { path: cwd, isWorktree: false }
 
-  const gitFile = await readFile(gitEntry, 'utf-8').catch(() => null)
-  if (gitFile === null) return { path: cwd, isWorktree: false }
-
-  const match = gitFile.match(/^gitdir:\s*(.+?)\s*$/m)
-  if (!match?.[1]) return { path: cwd, isWorktree: false }
-
-  const gitDir = resolve(trimmed, match[1])
-  const normalizedGitDir = gitDir.replace(/\\/g, '/')
-  const worktreeMarker = '/.git/worktrees/'
-  const markerIndex = normalizedGitDir.lastIndexOf(worktreeMarker)
-  if (markerIndex === -1) return { path: cwd, isWorktree: false }
-
-  return { path: normalizedGitDir.slice(0, markerIndex), isWorktree: true }
+  let dir = trimmed
+  while (true) {
+    const gitEntry = join(dir, '.git')
+    const entryStat = await lstat(gitEntry).catch(() => null)
+    if (entryStat?.isDirectory()) return { path: dir, isWorktree: false }
+    if (entryStat?.isFile()) {
+      const gitFile = await readFile(gitEntry, 'utf-8').catch(() => null)
+      if (gitFile === null) return { path: dir, isWorktree: false }
+      const match = gitFile.match(/^gitdir:\s*(.+?)\s*$/m)
+      if (!match?.[1]) return { path: dir, isWorktree: false }
+      const gitDir = resolve(dir, match[1])
+      const normalizedGitDir = gitDir.replace(/\\/g, '/')
+      const worktreeMarker = '/.git/worktrees/'
+      const markerIndex = normalizedGitDir.lastIndexOf(worktreeMarker)
+      if (markerIndex === -1) return { path: dir, isWorktree: false }
+      return { path: normalizedGitDir.slice(0, markerIndex), isWorktree: true }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return { path: cwd, isWorktree: false }
+    dir = parent
+  }
 }
 
 const LARGE_JSONL_LINE_BYTES = 32 * 1024
@@ -1450,7 +1486,7 @@ async function scanProjectDirs(
 
     const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds)
     const cwd = extractCanonicalCwd(entries)
-    const canonical = cwd ? await resolveCanonicalProjectPath(cwd) : undefined
+    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
     section.files[filePath] = {
       fingerprint: info.fp,
       lastCompleteLineOffset: tracker.lastCompleteLineOffset,
@@ -2103,15 +2139,43 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
     try { await saveCache(diskCache) } catch {}
   }
 
+  // Merge across providers by normalised project path so the same repository
+  // is not double-counted when it was worked on with more than one tool
+  // (e.g. both Claude Code and Codex). Two sub-problems:
+  //
+  // 1. Codex's sanitizeProject strips the leading '/' from cwds, so
+  //    "Users/carlo/foo" and "/Users/carlo/foo" must compare equal. We
+  //    normalise by stripping leading slashes before keying.
+  //
+  // 2. Codex worktrees (e.g. ~/.codex/worktrees/e55f/Repo) are not resolved
+  //    to their main-repo path by canonicalizeProviderCallProject because that
+  //    function only operates on call.projectPath, which Codex doesn't set.
+  //    Resolve at the ProjectSummary level here: prepend '/' if needed to get
+  //    an absolute path, then run the same worktree-detection logic.
+  const resolvedOtherProjects = await Promise.all(otherProjects.map(async p => {
+    const absPath = p.projectPath.startsWith('/') || p.projectPath.startsWith('\\')
+      ? p.projectPath
+      : '/' + p.projectPath
+    const canonical = await resolveCanonicalProjectPath(absPath)
+    // Skip if path is unchanged: same location, not a worktree, not a subdir
+    if (!canonical.isWorktree && canonical.path === absPath.replace(/[/\\]+$/, '')) return p
+    return { ...p, project: projectNameFromPath(canonical.path, p.project), projectPath: canonical.path }
+  }))
+
+  const crossProviderKey = (p: ProjectSummary): string => {
+    const path = p.projectPath.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase()
+    return path.includes('/') ? path : p.project.toLowerCase()
+  }
   const mergedMap = new Map<string, ProjectSummary>()
-  for (const p of [...claudeProjects, ...otherProjects]) {
-    const existing = mergedMap.get(p.project)
+  for (const p of [...claudeProjects, ...resolvedOtherProjects]) {
+    const key = crossProviderKey(p)
+    const existing = mergedMap.get(key)
     if (existing) {
       existing.sessions.push(...p.sessions)
       existing.totalCostUSD += p.totalCostUSD
       existing.totalApiCalls += p.totalApiCalls
     } else {
-      mergedMap.set(p.project, { ...p })
+      mergedMap.set(key, { ...p })
     }
   }
 
