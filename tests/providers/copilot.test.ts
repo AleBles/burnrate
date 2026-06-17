@@ -598,7 +598,7 @@ describe('copilot provider - OTel cache token parsing', () => {
     const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
 
-    const otelSources = sources.filter(s => s.path === dbPath)
+    const otelSources = sources.filter(s => s.path.startsWith(dbPath))
     expect(otelSources).toHaveLength(1)
     expect(otelSources[0]!.provider).toBe('copilot')
 
@@ -617,7 +617,7 @@ describe('copilot provider - OTel cache token parsing', () => {
     expect(call.costUSD).toBeGreaterThan(0)
   })
 
-  it('discovers one source per conversation from the same DB file', async () => {
+  it('discovers one source per OTel DB file (not per conversation)', async () => {
     if (!isSqliteAvailable()) return
 
     createOtelDb(dbPath)
@@ -649,13 +649,19 @@ describe('copilot provider - OTel cache token parsing', () => {
     const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
 
+    // One source per DB file (not per conversation)
     const otelSources = sources.filter(s => s.path === dbPath)
-    // Exactly one source per conversation, both pointing to the same DB file
-    expect(otelSources).toHaveLength(2)
-    expect(otelSources.every(s => s.path === dbPath)).toBe(true)
-    // Each conversation should have a distinct identity (provider routes by conversationId)
-    const convIds = otelSources.map(s => (s as { conversationId?: string }).conversationId)
-    expect(new Set(convIds).size).toBe(2)
+    expect(otelSources).toHaveLength(1)
+    expect(otelSources[0]!.path).toBe(dbPath)
+
+    // But the parser still yields calls from BOTH conversations
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSources[0]!, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls).toHaveLength(2)
+    const sessionIds = new Set(calls.map(c => c.sessionId))
+    expect(sessionIds.size).toBe(2)
   })
 
   it('preserves cache tokens when parsing multiple conversations from one DB', async () => {
@@ -688,16 +694,12 @@ describe('copilot provider - OTel cache token parsing', () => {
 
     const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
-    const otelSources = sources.filter(s => s.path === dbPath)
-    expect(otelSources).toHaveLength(2)
-
-    // Parse all sources; each must carry its own cache tokens
-    const seenKeys = new Set<string>()
+    // One source per DB file — the parser iterates all conversations internally
+    const otelSource = sources.find(s => s.path === dbPath)
+    expect(otelSource).toBeDefined()
     const allCalls: ParsedProviderCall[] = []
-    for (const src of otelSources) {
-      for await (const call of provider.createSessionParser(src, seenKeys).parse()) {
-        allCalls.push(call)
-      }
+    for await (const call of provider.createSessionParser(otelSource!, new Set()).parse()) {
+      allCalls.push(call)
     }
 
     expect(allCalls).toHaveLength(2)
@@ -736,7 +738,7 @@ describe('copilot provider - OTel cache token parsing', () => {
 
     const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
-    const src = sources.find(s => s.path === dbPath)
+    const src = sources.find(s => s.path.startsWith(dbPath))
     expect(src).toBeDefined()
 
     const calls: ParsedProviderCall[] = []
@@ -767,7 +769,7 @@ describe('copilot provider - OTel cache token parsing', () => {
 
     const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
-    const src = sources.find(s => s.path === dbPath)
+    const src = sources.find(s => s.path.startsWith(dbPath))
     expect(src).toBeDefined()
 
     const calls: ParsedProviderCall[] = []
@@ -776,5 +778,42 @@ describe('copilot provider - OTel cache token parsing', () => {
     }
     // Span with zero input AND output tokens is skipped
     expect(calls).toHaveLength(0)
+  })
+
+  it('OTel source path equals the plain DB file path and durableSources is true', async () => {
+    if (!isSqliteAvailable()) return
+
+    createOtelDb(dbPath)
+    insertSpan(dbPath, {
+      spanId: 'span-g1', traceId: 'trace-g', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-g',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 100,
+        'gen_ai.usage.output_tokens': 10,
+        'gen_ai.usage.cache_read.input_tokens': 0,
+        'gen_ai.usage.cache_creation.input_tokens': 0,
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+
+    // durableSources must be true on the copilot provider
+    expect(provider.durableSources).toBe(true)
+
+    const sources = await provider.discoverSessions()
+    const otelSrc = sources.find(s => s.path.startsWith(dbPath))
+    expect(otelSrc).toBeDefined()
+
+    // Path is the plain DB file path (no #otel-conv= compound suffix)
+    expect(otelSrc!.path).toBe(dbPath)
+
+    // Parser must open the DB and produce results for all conversations
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSrc!, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(100)
   })
 })

@@ -16,6 +16,7 @@ import {
   type SessionCache,
   cleanupOrphanedTempFiles,
   computeEnvFingerprint,
+  DURABLE_PROVIDER_NAMES,
   fingerprintFile,
   loadCache,
   reconcileFile,
@@ -2018,7 +2019,9 @@ async function parseProviderSources(
 
       // Clear stale entry before parse — but only once per path so that
       // multiple sources mapping to the same file path can merge their turns.
-      if (!clearedPaths.has(source.path)) {
+      // Durable providers (e.g. copilot OTel) never clear existing entries so
+      // that pruned-away data is preserved for monotonic monthly totals.
+      if (!provider.durableSources && !clearedPaths.has(source.path)) {
         delete section.files[source.path]
         clearedPaths.add(source.path)
       }
@@ -2042,20 +2045,43 @@ async function parseProviderSources(
           console.warn(`[Parse] After conversion: ${turns.length} turns, calls with cache: ${turns.flatMap(t => t.calls).filter(c => c.usage.cacheReadInputTokens > 0 || c.usage.cacheCreationInputTokens > 0).length}`)
         }
         
-        // For files with multiple sources (e.g., OTel database with many conversations),
-        // merge turns instead of overwriting. This allows us to parse the same file
-        // multiple times for different conversations and aggregate all results.
-        const existingCacheEntry = section.files[source.path]
-        if (process.env['DEBUG_OTEL']) {
-          console.warn(`[Parse] Cache entry exists for path: ${!!existingCacheEntry}, turns to merge: ${turns.length}`)
-        }
-        if (existingCacheEntry) {
-          existingCacheEntry.turns = [...existingCacheEntry.turns, ...turns]
-          if (process.env['DEBUG_OTEL']) {
-            console.warn(`[Parse] Merged with existing cache entry for ${source.path.substring(0, 40)}, now has ${existingCacheEntry.turns.length} turns total`)
+        // Store/merge parsed turns into the cache.
+        // Durable providers use a union-by-deduplicationKey merge: existing turns
+        // are NEVER deleted (preserves data for spans pruned from the DB), and
+        // only turns whose dedup keys are not already cached are appended.
+        // Non-durable providers keep the original overwrite-or-append behaviour.
+        if (provider.durableSources) {
+          const existingEntry = section.files[source.path]
+          if (existingEntry) {
+            const existingKeys = new Set(
+              existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
+            )
+            const newTurns = turns.filter(t =>
+              t.calls.every(c => !existingKeys.has(c.deduplicationKey))
+            )
+            existingEntry.turns = [...existingEntry.turns, ...newTurns]
+            existingEntry.fingerprint = fp
+            if (process.env['DEBUG_OTEL']) {
+              console.warn(`[Parse] Durable union-merge for ${source.path.substring(0, 40)}: kept ${existingEntry.turns.length - newTurns.length} existing, added ${newTurns.length} new turns`)
+            }
+          } else {
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
           }
         } else {
-          section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+          // Non-durable: overwrite (clearedPaths already deleted stale entry above)
+          // or append when multiple sources map to the same path.
+          const existingCacheEntry = section.files[source.path]
+          if (process.env['DEBUG_OTEL']) {
+            console.warn(`[Parse] Cache entry exists for path: ${!!existingCacheEntry}, turns to merge: ${turns.length}`)
+          }
+          if (existingCacheEntry) {
+            existingCacheEntry.turns = [...existingCacheEntry.turns, ...turns]
+            if (process.env['DEBUG_OTEL']) {
+              console.warn(`[Parse] Merged with existing cache entry for ${source.path.substring(0, 40)}, now has ${existingCacheEntry.turns.length} turns total`)
+            }
+          } else {
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+          }
         }
         didParse = true
         ;(diskCache as { _dirty?: boolean })._dirty = true
@@ -2084,9 +2110,33 @@ async function parseProviderSources(
     }
   }
 
-  if (sources.length > 0) {
+  // Stamp the durable flag into the cache section so the orphan-bootstrap in
+  // parseAllSessions can fast-check without a getProvider() round-trip.
+  if (provider.durableSources && !section.durable) {
+    section.durable = true
+    ;(diskCache as { _dirty?: boolean })._dirty = true
+  }
+
+  if (sources.length > 0 && !provider.durableSources) {
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
+        delete section.files[cachedPath]
+        ;(diskCache as { _dirty?: boolean })._dirty = true
+      }
+    }
+  }
+
+  // 90-day age-out for durable providers: remove entries whose newest call is
+  // older than 90 days so the cache doesn't grow unboundedly over time.
+  if (provider.durableSources) {
+    const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
+    for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      const newestTs = cachedFile.turns
+        .flatMap(t => t.calls)
+        .map(c => new Date(c.timestamp).getTime())
+        .filter(ts => !isNaN(ts))
+        .reduce((max, ts) => Math.max(max, ts), 0)
+      if (newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
         ;(diskCache as { _dirty?: boolean })._dirty = true
       }
@@ -2148,6 +2198,43 @@ async function parseProviderSources(
         }
       } else {
         sessionMap.set(key, { project, projectPath: turn.calls[0]?.projectPath, turns: [classified] })
+      }
+    }
+  }
+
+  // Second pass: durable orphans — cache entries for paths that are no longer
+  // discovered (e.g. OTel conversations pruned from the DB). Their turns are
+  // counted here so the monthly total never drops.
+  if (provider.durableSources) {
+    for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      if (allDiscoveredFiles.has(cachedPath)) continue  // already counted above
+
+      for (const turn of cachedFile.turns) {
+        const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
+        if (hasDup) continue
+
+        for (const c of turn.calls) seenKeys.add(c.deduplicationKey)
+
+        if (dateRange) {
+          const callTs = turn.calls[0]?.timestamp
+          if (!callTs) continue
+          const ts = new Date(callTs)
+          if (ts < dateRange.start || ts > dateRange.end) continue
+        }
+
+        const classified = cachedTurnToClassified(turn)
+        const project = turn.calls[0]?.project ?? providerName
+        const key = `${providerName}:${turn.sessionId}:${project}`
+
+        const existingEntry = sessionMap.get(key)
+        if (existingEntry) {
+          existingEntry.turns.push(classified)
+          if (!existingEntry.projectPath && turn.calls[0]?.projectPath) {
+            existingEntry.projectPath = turn.calls[0]!.projectPath
+          }
+        } else {
+          sessionMap.set(key, { project, projectPath: turn.calls[0]?.projectPath, turns: [classified] })
+        }
       }
     }
   }
@@ -2311,6 +2398,26 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   const otherProjects: ProjectSummary[] = []
   for (const [providerName, sources] of providerGroups) {
     const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange)
+    otherProjects.push(...projects)
+  }
+
+  // Durable providers with cached data but NO discovered sources (all files pruned
+  // by VS Code / the external tool) still need their orphan pass to run so the
+  // monthly total never drops. Call parseProviderSources with empty sources for
+  // any such provider found in the disk cache.
+  const processedProviders = new Set(providerGroups.keys())
+  for (const providerName of Object.keys(diskCache.providers)) {
+    if (processedProviders.has(providerName)) continue
+    // Skip if filtered to a different provider
+    if (providerFilter && providerFilter !== 'all' && providerFilter !== providerName) continue
+    const section = diskCache.providers[providerName]
+    if (!section || Object.keys(section.files).length === 0) continue
+    // Use the persisted durable flag (set by parseProviderSources when it first
+    // processes a durableSources provider) OR the static DURABLE_PROVIDER_NAMES
+    // constant — both checks are O(1) and avoid a getProvider() dynamic-import
+    // round-trip for every unprocessed provider in the disk cache.
+    if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
+    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange)
     otherProjects.push(...projects)
   }
 

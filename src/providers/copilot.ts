@@ -527,159 +527,183 @@ function createOtelParser(
       // Lazy-load the SQLite module (same pattern as Cursor/OpenCode providers)
       const { openDatabase } = await import('../sqlite.js')
 
+      // One DB open handles ALL conversations — avoids N opens for N conversations.
       const db = openDatabase(source.path)
       if (!db) return
 
       try {
-        // The conversation_id is stored in source.project for OTel sources
-        // (set during discoverSessions). We use it to scope our queries.
-        const conversationId = (source as OTelSessionSource).conversationId
-
         // ---------------------------------------------------------------
-        // Query all 'chat' spans for this conversation.
-        // 'chat' spans represent individual LLM API calls and carry the
-        // per-call token breakdown we need.
-        //
-        // DB schema (from VS Code Copilot Chat's otelSqliteStore):
-        //   Table: spans (with direct columns for denormalized data)
-        //   Table: span_attributes (key-value pairs for OTel semantics)
-        //   Join on span_id to get full attribute data
+        // Get all distinct conversations in the DB with their project names.
         // ---------------------------------------------------------------
-
-        // First, get all spans with this conversation_id from span_attributes
-        const spanIdRows = db.query<{ span_id: string; trace_id: string }>(
-          `SELECT DISTINCT s.span_id, s.trace_id
+        const conversationRows = db.query<{
+          conversation_id: string
+          project: string | null
+          min_start: number
+        }>(
+          `SELECT DISTINCT
+             sa_conv.value AS conversation_id,
+             COALESCE(sa_repo.value, 'copilot-chat') AS project,
+             MIN(s.start_time_ms) AS min_start
            FROM spans s
-           INNER JOIN span_attributes sa 
-             ON s.span_id = sa.span_id AND sa.key = 'gen_ai.conversation.id' AND sa.value = ?
-           ORDER BY s.start_time_ms ASC`,
-          [conversationId]
+           LEFT JOIN span_attributes sa_conv
+             ON s.span_id = sa_conv.span_id AND sa_conv.key = 'gen_ai.conversation.id'
+           LEFT JOIN span_attributes sa_repo
+             ON s.span_id = sa_repo.span_id AND sa_repo.key = 'github.copilot.git.repository'
+           WHERE sa_conv.value IS NOT NULL
+           GROUP BY sa_conv.value
+           ORDER BY min_start DESC`
         )
 
-        if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${spanIdRows.length} spans for conversation ${conversationId}`)
+        if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${conversationRows.length} conversations in DB`)
 
-        // Collect trace IDs and span IDs belonging to this conversation
-        const traceIds = new Set<string>()
-        for (const row of spanIdRows) {
-          traceIds.add(row.trace_id)
-        }
+        for (const convRow of conversationRows) {
+          const conversationId = convRow.conversation_id
+          if (!conversationId) continue
 
-        if (traceIds.size === 0) {
-          if (process.env['DEBUG_OTEL']) console.warn(`[OTel] No trace IDs found for conversation`)
-          return
-        }
-
-        // Now query all spans within those traces to find chat and tool spans
-        const traceIdList = [...traceIds].map((id) => `'${id.replace(/'/g, "''")}'`).join(',')
-        const traceSpans = db.query<{ span_id: string; trace_id: string; operation_name: string | null }>(
-          `SELECT span_id, trace_id, operation_name FROM spans WHERE trace_id IN (${traceIdList})`
-        )
-
-        if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${traceSpans.length} total spans across ${traceIds.size} traces`)
-
-        // Collect tool names from execute_tool spans for each trace
-        const toolsByTrace = new Map<string, string[]>()
-        const chatSpanIds: string[] = []
-
-        for (const span of traceSpans) {
-          const opName = span.operation_name || ''
-
-          if (opName === 'chat') {
-            chatSpanIds.push(span.span_id)
+          let project = convRow.project ?? 'copilot-chat'
+          if (project.includes('/')) {
+            project = basename(project.replace(/\.git$/, ''))
           }
 
-          if (opName === 'execute_tool') {
-            // Load tool name from attributes and normalise to display form
-            const attrs = loadSpanAttributesFromTable(db, span.span_id)
-            const rawToolName = attrs['gen_ai.tool.name'] as string | undefined
-            if (rawToolName) {
-              const existing = toolsByTrace.get(span.trace_id) ?? []
-              existing.push(normalizeTool(rawToolName))
-              toolsByTrace.set(span.trace_id, existing)
-            }
-          }
-        }
+          // -----------------------------------------------------------
+          // Query all 'chat' spans for this conversation.
+          // -----------------------------------------------------------
 
-        if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${chatSpanIds.length} chat spans`)
-
-        // Yield one ParsedProviderCall per chat span
-        for (const spanId of chatSpanIds) {
-          const attrs = loadSpanAttributesFromTable(db, spanId)
-
-          // Get span metadata from the spans table
-          const spanMetadata = db.query<{ trace_id: string; start_time_ms: number; response_model: string | null }>(
-            `SELECT trace_id, start_time_ms, response_model FROM spans WHERE span_id = ?`,
-            [spanId]
-          )?.[0]
-
-          if (!spanMetadata) {
-            if (process.env['DEBUG_OTEL']) console.warn(`[OTel] No metadata for span ${spanId}`)
-            continue
-          }
-
-          const model =
-            (attrs['gen_ai.response.model'] as string | undefined) ??
-            (attrs['gen_ai.request.model'] as string | undefined) ??
-            spanMetadata.response_model ??
-            'unknown'
-
-          const inputTokens = Number(attrs['gen_ai.usage.input_tokens'] ?? 0)
-          const outputTokens = Number(attrs['gen_ai.usage.output_tokens'] ?? 0)
-          const cacheReadTokens = Number(attrs['gen_ai.usage.cache_read.input_tokens'] ?? 0)
-          const cacheCreationTokens = Number(attrs['gen_ai.usage.cache_creation.input_tokens'] ?? 0)
-
-          if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Span ${spanId.substring(0, 8)}: model=${model}, input=${inputTokens}, output=${outputTokens}, cache_read=${cacheReadTokens}, cache_creation=${cacheCreationTokens}`)
-
-          if (inputTokens === 0 && outputTokens === 0) {
-            if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Skipping span with 0 tokens`)
-            continue
-          }
-
-          // Dedup key uses span_id which is globally unique
-          const dedupKey = `copilot-otel:${spanId}`
-          if (seenKeys.has(dedupKey)) continue
-          seenKeys.add(dedupKey)
-
-          // Also add a JSONL-style dedupKey pattern so that if the same
-          // interaction appears in both OTel and JSONL, we don't double-count.
-          // We use the turn ID from Copilot attributes if available.
-          const turnId = attrs['github.copilot.chat.turn.id'] as string | undefined
-          if (turnId) {
-            const jsonlDedupKey = `copilot:${conversationId}:${turnId}`
-            seenKeys.add(jsonlDedupKey)
-          }
-
-          const tools = toolsByTrace.get(spanMetadata.trace_id) ?? []
-          const timestamp = epochToISO(spanMetadata.start_time_ms)
-
-          // calculateCost with FULL token data — this is the key improvement.
-          const costUSD = calculateCost(
-            model,
-            inputTokens,
-            outputTokens,
-            cacheCreationTokens,
-            cacheReadTokens,
-            0 // reasoningTokens — not exposed in current OTel schema
+          const spanIdRows = db.query<{ span_id: string; trace_id: string }>(
+            `SELECT DISTINCT s.span_id, s.trace_id
+             FROM spans s
+             INNER JOIN span_attributes sa 
+               ON s.span_id = sa.span_id AND sa.key = 'gen_ai.conversation.id' AND sa.value = ?
+             ORDER BY s.start_time_ms ASC`,
+            [conversationId]
           )
 
-          yield {
-            provider: 'copilot',
-            sessionId: conversationId,
-            model,
-            inputTokens,
-            outputTokens,
-            cacheCreationInputTokens: cacheCreationTokens,
-            cacheReadInputTokens: cacheReadTokens,
-            cachedInputTokens: 0,
-            reasoningTokens: 0,
-            webSearchRequests: 0,
-            costUSD,
-            tools,
-            bashCommands: [],
-            timestamp,
-            speed: 'standard' as const,
-            deduplicationKey: dedupKey,
-            userMessage: '', // Not available in OTel spans by default
+          if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${spanIdRows.length} spans for conversation ${conversationId}`)
+
+          // Collect trace IDs and span IDs belonging to this conversation
+          const traceIds = new Set<string>()
+          for (const row of spanIdRows) {
+            traceIds.add(row.trace_id)
+          }
+
+          if (traceIds.size === 0) {
+            if (process.env['DEBUG_OTEL']) console.warn(`[OTel] No trace IDs found for conversation`)
+            continue
+          }
+
+          // Now query all spans within those traces to find chat and tool spans
+          const traceIdList = [...traceIds].map((id) => `'${id.replace(/'/g, "''")}'`).join(',')
+          const traceSpans = db.query<{ span_id: string; trace_id: string; operation_name: string | null }>(
+            `SELECT span_id, trace_id, operation_name FROM spans WHERE trace_id IN (${traceIdList})`
+          )
+
+          if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${traceSpans.length} total spans across ${traceIds.size} traces`)
+
+          // Collect tool names from execute_tool spans for each trace
+          const toolsByTrace = new Map<string, string[]>()
+          const chatSpanIds: string[] = []
+
+          for (const span of traceSpans) {
+            const opName = span.operation_name || ''
+
+            if (opName === 'chat') {
+              chatSpanIds.push(span.span_id)
+            }
+
+            if (opName === 'execute_tool') {
+              // Load tool name from attributes and normalise to display form
+              const attrs = loadSpanAttributesFromTable(db, span.span_id)
+              const rawToolName = attrs['gen_ai.tool.name'] as string | undefined
+              if (rawToolName) {
+                const existing = toolsByTrace.get(span.trace_id) ?? []
+                existing.push(normalizeTool(rawToolName))
+                toolsByTrace.set(span.trace_id, existing)
+              }
+            }
+          }
+
+          if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Found ${chatSpanIds.length} chat spans`)
+
+          // Yield one ParsedProviderCall per chat span
+          for (const spanId of chatSpanIds) {
+            const attrs = loadSpanAttributesFromTable(db, spanId)
+
+            // Get span metadata from the spans table
+            const spanMetadata = db.query<{ trace_id: string; start_time_ms: number; response_model: string | null }>(
+              `SELECT trace_id, start_time_ms, response_model FROM spans WHERE span_id = ?`,
+              [spanId]
+            )?.[0]
+
+            if (!spanMetadata) {
+              if (process.env['DEBUG_OTEL']) console.warn(`[OTel] No metadata for span ${spanId}`)
+              continue
+            }
+
+            const model =
+              (attrs['gen_ai.response.model'] as string | undefined) ??
+              (attrs['gen_ai.request.model'] as string | undefined) ??
+              spanMetadata.response_model ??
+              'unknown'
+
+            const inputTokens = Number(attrs['gen_ai.usage.input_tokens'] ?? 0)
+            const outputTokens = Number(attrs['gen_ai.usage.output_tokens'] ?? 0)
+            const cacheReadTokens = Number(attrs['gen_ai.usage.cache_read.input_tokens'] ?? 0)
+            const cacheCreationTokens = Number(attrs['gen_ai.usage.cache_creation.input_tokens'] ?? 0)
+
+            if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Span ${spanId.substring(0, 8)}: model=${model}, input=${inputTokens}, output=${outputTokens}, cache_read=${cacheReadTokens}, cache_creation=${cacheCreationTokens}`)
+
+            if (inputTokens === 0 && outputTokens === 0) {
+              if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Skipping span with 0 tokens`)
+              continue
+            }
+
+            // Dedup key uses span_id which is globally unique
+            const dedupKey = `copilot-otel:${spanId}`
+            if (seenKeys.has(dedupKey)) continue
+            seenKeys.add(dedupKey)
+
+            // Also add a JSONL-style dedupKey pattern so that if the same
+            // interaction appears in both OTel and JSONL, we don't double-count.
+            // We use the turn ID from Copilot attributes if available.
+            const turnId = attrs['github.copilot.chat.turn.id'] as string | undefined
+            if (turnId) {
+              const jsonlDedupKey = `copilot:${conversationId}:${turnId}`
+              seenKeys.add(jsonlDedupKey)
+            }
+
+            const tools = toolsByTrace.get(spanMetadata.trace_id) ?? []
+            const timestamp = epochToISO(spanMetadata.start_time_ms)
+
+            // calculateCost with FULL token data — this is the key improvement.
+            const costUSD = calculateCost(
+              model,
+              inputTokens,
+              outputTokens,
+              cacheCreationTokens,
+              cacheReadTokens,
+              0 // reasoningTokens — not exposed in current OTel schema
+            )
+
+            yield {
+              provider: 'copilot',
+              sessionId: conversationId,
+              project,
+              model,
+              inputTokens,
+              outputTokens,
+              cacheCreationInputTokens: cacheCreationTokens,
+              cacheReadInputTokens: cacheReadTokens,
+              cachedInputTokens: 0,
+              reasoningTokens: 0,
+              webSearchRequests: 0,
+              costUSD,
+              tools,
+              bashCommands: [],
+              timestamp,
+              speed: 'standard' as const,
+              deduplicationKey: dedupKey,
+              userMessage: '', // Not available in OTel spans by default
+            }
           }
         }
       } finally {
@@ -694,7 +718,7 @@ function createOtelParser(
 // ---------------------------------------------------------------------------
 
 interface OTelSessionSource extends SessionSource {
-  conversationId: string
+  conversationId?: string
   sourceType: 'otel'
 }
 
@@ -756,75 +780,15 @@ async function discoverJsonlSessions(
 async function discoverOtelSessions(
   dbPath: string
 ): Promise<OTelSessionSource[]> {
-  const sources: OTelSessionSource[] = []
-
-  // Lazy-load SQLite
-  let openDatabase: (path: string) => ReturnType<typeof import('../sqlite.js')['openDatabase']>
+  // Verify the DB file exists. Return one source per DB file; the parser
+  // opens the DB once and iterates all conversations in a single DB open,
+  // which is far more efficient than one source (and one DB open) per conversation.
   try {
-    const sqliteModule = await import('../sqlite.js')
-    openDatabase = sqliteModule.openDatabase
+    await stat(dbPath)
   } catch {
-    if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Failed to import sqlite module`)
-    return sources
+    return []
   }
-
-  const db = openDatabase(dbPath)
-  if (!db) {
-    if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Failed to open database`)
-    return sources
-  }
-
-  try {
-    // Find all unique conversation IDs from spans that have the attribute.
-    // Join with span_attributes to find spans with 'gen_ai.conversation.id'.
-    const rows = db.query<{
-      conversation_id: string
-      project: string
-      min_start: number
-    }>(
-      `SELECT DISTINCT
-         sa_conv.value AS conversation_id,
-         COALESCE(sa_repo.value, 'copilot-chat') AS project,
-         MIN(s.start_time_ms) AS min_start
-       FROM spans s
-       LEFT JOIN span_attributes sa_conv 
-         ON s.span_id = sa_conv.span_id AND sa_conv.key = 'gen_ai.conversation.id'
-       LEFT JOIN span_attributes sa_repo 
-         ON s.span_id = sa_repo.span_id AND sa_repo.key = 'github.copilot.git.repository'
-       WHERE sa_conv.value IS NOT NULL
-       GROUP BY conversation_id
-       ORDER BY min_start DESC`
-    )
-
-    if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Discovery: Found ${rows.length} conversations`)
-
-    for (const row of rows) {
-      if (!row.conversation_id) continue
-
-      // Use the git repository name as the project, or fall back to 'copilot-chat'
-      let project = row.project ?? 'copilot-chat'
-      // Clean up repository URLs to just the repo name
-      if (project.includes('/')) {
-        project = basename(project.replace(/\.git$/, ''))
-      }
-
-      sources.push({
-        path: dbPath,
-        project,
-        provider: 'copilot',
-        sourceType: 'otel',
-        conversationId: row.conversation_id,
-      })
-    }
-  } catch (e) {
-    // DB might have a different schema or be locked — fall through silently
-    if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Discovery error:`, e)
-  } finally {
-    db.close()
-  }
-
-  if (process.env['DEBUG_OTEL']) console.warn(`[OTel] Discovery complete: ${sources.length} sessions found`)
-  return sources
+  return [{ path: dbPath, project: 'copilot-chat', provider: 'copilot', sourceType: 'otel' }]
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +914,7 @@ export function createCopilotProvider(sessionStateDir?: string, workspaceStorage
   return {
     name: 'copilot',
     displayName: 'Copilot',
+    durableSources: true,
 
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
