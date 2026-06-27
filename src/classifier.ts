@@ -1,4 +1,4 @@
-import type { ClassifiedTurn, ParsedTurn, TaskCategory } from './types.js'
+import type { ClassifiedTurn, ParsedTurn, TaskCategory, ToolCall } from './types.js'
 
 const TEST_PATTERNS = /\b(test|pytest|vitest|jest|mocha|spec|coverage|npm\s+test|npx\s+vitest|npx\s+jest)\b/i
 const GIT_PATTERNS = /\bgit\s+(push|pull|commit|merge|rebase|checkout|branch|stash|log|diff|status|add|reset|cherry-pick|tag)\b/i
@@ -15,7 +15,7 @@ const FILE_PATTERNS = /\.(py|js|ts|tsx|jsx|json|yaml|yml|toml|sql|sh|go|rs|java|
 const SCRIPT_PATTERNS = /\b(run\s+\S+\.\w+|execute|scrip?t|curl|api\s+\S+|endpoint|request\s+url|fetch\s+\S+|query|database|db\s+\S+)\b/i
 const URL_PATTERN = /https?:\/\/\S+/i
 
-const EDIT_TOOLS = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit', 'cursor:edit'])
+export const EDIT_TOOLS = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit', 'cursor:edit'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'FileReadTool', 'GrepTool', 'GlobTool'])
 export const BASH_TOOLS = new Set(['Bash', 'BashTool', 'PowerShellTool'])
 const TASK_TOOLS = new Set(['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TodoWrite'])
@@ -51,6 +51,10 @@ function hasSkillTool(tools: string[]): boolean {
 
 function getAllTools(turn: ParsedTurn): string[] {
   return turn.assistantCalls.flatMap(c => c.tools)
+}
+
+function getAllSkills(turn: ParsedTurn): string[] {
+  return turn.assistantCalls.flatMap(c => c.skills ?? [])
 }
 
 function classifyByToolPattern(turn: ParsedTurn): TaskCategory | null {
@@ -89,12 +93,38 @@ function classifyByToolPattern(turn: ParsedTurn): TaskCategory | null {
   return null
 }
 
+/// Picks the category whose keyword pattern matches earliest in the message.
+/// On a tie (same start index) the candidate listed first in `candidates` wins,
+/// so callers control tie-break priority by ordering. Returns null when no
+/// pattern matches. The first-match heuristic fixes the long-standing problem
+/// where "add error handling" was tagged Debugging because the DEBUG regex was
+/// checked before FEATURE; now FEATURE wins because "add" appears before
+/// "error". Issue #196.
+function firstMatchingCategory(
+  text: string,
+  candidates: ReadonlyArray<{ regex: RegExp; category: TaskCategory }>,
+): TaskCategory | null {
+  let best: { index: number; order: number; category: TaskCategory } | null = null
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i]!
+    const m = c.regex.exec(text)
+    if (!m) continue
+    if (!best || m.index < best.index || (m.index === best.index && i < best.order)) {
+      best = { index: m.index, order: i, category: c.category }
+    }
+  }
+  return best?.category ?? null
+}
+
 function refineByKeywords(category: TaskCategory, userMessage: string): TaskCategory {
   if (category === 'coding') {
-    if (DEBUG_KEYWORDS.test(userMessage)) return 'debugging'
-    if (REFACTOR_KEYWORDS.test(userMessage)) return 'refactoring'
-    if (FEATURE_KEYWORDS.test(userMessage)) return 'feature'
-    return 'coding'
+    // Tie-break order (when two keywords match at the same index): refactoring
+    // first because its words are the most specific, then feature, then debug.
+    return firstMatchingCategory(userMessage, [
+      { regex: REFACTOR_KEYWORDS, category: 'refactoring' },
+      { regex: FEATURE_KEYWORDS, category: 'feature' },
+      { regex: DEBUG_KEYWORDS, category: 'debugging' },
+    ]) ?? 'coding'
   }
 
   if (category === 'exploration') {
@@ -109,8 +139,14 @@ function refineByKeywords(category: TaskCategory, userMessage: string): TaskCate
 function classifyConversation(userMessage: string): TaskCategory {
   if (BRAINSTORM_KEYWORDS.test(userMessage)) return 'brainstorming'
   if (RESEARCH_KEYWORDS.test(userMessage)) return 'exploration'
-  if (DEBUG_KEYWORDS.test(userMessage)) return 'debugging'
-  if (FEATURE_KEYWORDS.test(userMessage)) return 'feature'
+  // Same first-match-wins logic as refineByKeywords so a chat-only message
+  // starting with a feature verb does not flip to debugging because of an
+  // incidental "error" or "fix" word later in the same sentence.
+  const debugOrFeature = firstMatchingCategory(userMessage, [
+    { regex: FEATURE_KEYWORDS, category: 'feature' },
+    { regex: DEBUG_KEYWORDS, category: 'debugging' },
+  ])
+  if (debugOrFeature) return debugOrFeature
   if (FILE_PATTERNS.test(userMessage)) return 'coding'
   if (SCRIPT_PATTERNS.test(userMessage)) return 'coding'
   if (URL_PATTERN.test(userMessage)) return 'exploration'
@@ -118,23 +154,34 @@ function classifyConversation(userMessage: string): TaskCategory {
 }
 
 function countRetries(turn: ParsedTurn): number {
-  let sawEditBeforeBash = false
-  let sawBashAfterEdit = false
-  let retries = 0
-
+  const steps: ToolCall[][] = []
   for (const call of turn.assistantCalls) {
-    const hasEdit = call.tools.some(t => EDIT_TOOLS.has(t))
-    const hasBash = call.tools.some(t => BASH_TOOLS.has(t))
-
-    if (hasEdit) {
-      if (sawBashAfterEdit) retries++
-      sawEditBeforeBash = true
-      sawBashAfterEdit = false
-    }
-    if (hasBash && sawEditBeforeBash) {
-      sawBashAfterEdit = true
+    if (call.toolSequence && call.toolSequence.length > 0) {
+      steps.push(...call.toolSequence)
+    } else if (call.tools.length > 0) {
+      steps.push(call.tools.map(t => ({ tool: t })))
     }
   }
+
+  const lastEditStep = new Map<string, number>()
+  let lastVerifyStep = -1
+  let retries = 0
+
+  steps.forEach((step, i) => {
+    for (const call of step) {
+      if (BASH_TOOLS.has(call.tool)) {
+        lastVerifyStep = i
+      }
+      if (EDIT_TOOLS.has(call.tool)) {
+        const fileKey = call.file ?? '__no_file__'
+        const prevStep = lastEditStep.get(fileKey)
+        if (prevStep !== undefined && lastVerifyStep > prevStep && lastVerifyStep < i) {
+          retries++
+        }
+        lastEditStep.set(fileKey, i)
+      }
+    }
+  })
 
   return retries
 }
@@ -159,5 +206,12 @@ export function classifyTurn(turn: ParsedTurn): ClassifiedTurn {
     }
   }
 
-  return { ...turn, category, retries: countRetries(turn), hasEdits: turnHasEdits(turn) }
+  const result: ClassifiedTurn = { ...turn, category, retries: countRetries(turn), hasEdits: turnHasEdits(turn) }
+
+  if (category === 'general') {
+    const skills = getAllSkills(turn)
+    if (skills.length > 0) result.subCategory = skills[0]
+  }
+
+  return result
 }

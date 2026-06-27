@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test'
+import { describe, it, expect, beforeEach } from 'vitest'
 
 import { getModelCosts, getShortModelName, resetPricingCache } from '../src/models.js'
 
@@ -30,6 +30,16 @@ describe('MiniMax model pricing', () => {
     expect(costs!.cacheReadCostPerToken).toBe(0.06e-6)
     expect(costs!.cacheWriteCostPerToken).toBe(0.375e-6)
     expect(costs!.fastMultiplier).toBe(1)
+  })
+
+  it('returns official pricing for MiniMax-M3', () => {
+    // M3 is gap-filled automatically (LiteLLM, with models.dev first-party as
+    // the cross-check): $0.6/$2.4 per M, the official MiniMax direct price - not
+    // a discounted reseller rate (e.g. OpenRouter's $0.3/$1.2).
+    const costs = getModelCosts('MiniMax-M3')
+    expect(costs).not.toBeNull()
+    expect(costs!.inputCostPerToken).toBe(0.6e-6)
+    expect(costs!.outputCostPerToken).toBe(2.4e-6)
   })
 
   it('highspeed pricing is distinct from base model pricing', () => {

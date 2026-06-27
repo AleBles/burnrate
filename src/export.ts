@@ -1,9 +1,10 @@
-import { writeFile, mkdir, readdir, stat, rm } from 'fs/promises'
+import { writeFile, mkdir, readdir, open, stat, rm } from 'fs/promises'
 import { dirname, join, resolve } from 'path'
 
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
-import { getCurrency, convertCost } from './currency.js'
+import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
+import { aggregateModelEfficiency } from './model-efficiency.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -35,6 +36,7 @@ function pct(n: number, total: number): number {
 
 type DailyAgg = {
   cost: number
+  savings: number
   calls: number
   input: number
   output: number
@@ -51,11 +53,12 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
         if (!turn.timestamp) continue
         const day = dateKey(turn.timestamp)
         if (!daily[day]) {
-          daily[day] = { cost: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set() }
+          daily[day] = { cost: 0, savings: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set() }
         }
         daily[day].sessions.add(session.sessionId)
         for (const call of turn.assistantCalls) {
           daily[day].cost += call.costUSD
+          daily[day].savings += call.savingsUSD ?? 0
           daily[day].calls++
           daily[day].input += call.usage.inputTokens
           daily[day].output += call.usage.outputTokens
@@ -69,7 +72,8 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
   return Object.entries(daily).sort().map(([date, d]) => ({
     Period: period,
     Date: date,
-    [`Cost (${code})`]: round2(convertCost(d.cost)),
+    [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
+    [`Saved (${code})`]: roundForActiveCurrency(convertCost(d.savings)),
     'API Calls': d.calls,
     Sessions: d.sessions.size,
     'Input Tokens': d.input,
@@ -97,20 +101,22 @@ function buildActivityRows(projects: ProjectSummary[], period: string): Row[] {
     .map(([cat, d]) => ({
       Period: period,
       Activity: CATEGORY_LABELS[cat as TaskCategory] ?? cat,
-      [`Cost (${code})`]: round2(convertCost(d.cost)),
+      [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
       'Share (%)': pct(d.cost, totalCost),
       Turns: d.turns,
     }))
 }
 
 function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
-  const modelTotals: Record<string, { calls: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }> = {}
+  const modelTotals: Record<string, { calls: number; cost: number; savings: number; input: number; output: number; cacheRead: number; cacheWrite: number }> = {}
+  const modelEfficiency = aggregateModelEfficiency(projects)
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [model, d] of Object.entries(session.modelBreakdown)) {
-        if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         modelTotals[model].calls += d.calls
         modelTotals[model].cost += d.costUSD
+        modelTotals[model].savings += d.savingsUSD
         modelTotals[model].input += d.tokens.inputTokens
         modelTotals[model].output += d.tokens.outputTokens
         modelTotals[model].cacheRead += d.tokens.cacheReadInputTokens ?? 0
@@ -122,18 +128,28 @@ function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
   const { code } = getCurrency()
   return Object.entries(modelTotals)
     .filter(([name]) => name !== '<synthetic>')
-    .sort(([, a], [, b]) => b.cost - a.cost)
-    .map(([model, d]) => ({
-      Period: period,
-      Model: model,
-      [`Cost (${code})`]: round2(convertCost(d.cost)),
-      'Share (%)': pct(d.cost, totalCost),
-      'API Calls': d.calls,
-      'Input Tokens': d.input,
-      'Output Tokens': d.output,
-      'Cache Read Tokens': d.cacheRead,
-      'Cache Write Tokens': d.cacheWrite,
-    }))
+    .sort(([, a], [, b]) => (b.cost + b.savings) - (a.cost + a.savings))
+    .map(([model, d]) => {
+      const efficiency = modelEfficiency.get(model)
+      return {
+        Period: period,
+        Model: model,
+        [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
+        [`Saved (${code})`]: roundForActiveCurrency(convertCost(d.savings)),
+        'Share (%)': pct(d.cost, totalCost),
+        'API Calls': d.calls,
+        'Edit Turns': efficiency?.editTurns ?? 0,
+        'One-shot Rate (%)': efficiency?.oneShotRate ?? '',
+        'Retries/Edit': efficiency?.retriesPerEdit ?? '',
+        [`Cost/Edit (${code})`]: efficiency?.costPerEditUSD !== null && efficiency?.costPerEditUSD !== undefined
+          ? roundForActiveCurrency(convertCost(efficiency.costPerEditUSD))
+          : '',
+        'Input Tokens': d.input,
+        'Output Tokens': d.output,
+        'Cache Read Tokens': d.cacheRead,
+        'Cache Write Tokens': d.cacheWrite,
+      }
+    })
 }
 
 function buildToolRows(projects: ProjectSummary[]): Row[] {
@@ -150,6 +166,25 @@ function buildToolRows(projects: ProjectSummary[]): Row[] {
     .sort(([, a], [, b]) => b - a)
     .map(([tool, calls]) => ({
       Tool: tool,
+      Calls: calls,
+      'Share (%)': pct(calls, total),
+    }))
+}
+
+function buildMcpRows(projects: ProjectSummary[]): Row[] {
+  const mcpTotals: Record<string, number> = {}
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const [server, d] of Object.entries(session.mcpBreakdown)) {
+        mcpTotals[server] = (mcpTotals[server] ?? 0) + d.calls
+      }
+    }
+  }
+  const total = Object.values(mcpTotals).reduce((s, n) => s + n, 0)
+  return Object.entries(mcpTotals)
+    .sort(([, a], [, b]) => b - a)
+    .map(([server, calls]) => ({
+      Server: server,
       Calls: calls,
       'Share (%)': pct(calls, total),
     }))
@@ -179,11 +214,12 @@ function buildProjectRows(projects: ProjectSummary[]): Row[] {
   const total = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   return projects
     .slice()
-    .sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+    .sort((a, b) => (b.totalCostUSD + b.totalSavingsUSD) - (a.totalCostUSD + a.totalSavingsUSD))
     .map(p => ({
       Project: p.projectPath,
-      [`Cost (${code})`]: round2(convertCost(p.totalCostUSD)),
-      [`Avg/Session (${code})`]: p.sessions.length > 0 ? round2(convertCost(p.totalCostUSD / p.sessions.length)) : '',
+      [`Cost (${code})`]: roundForActiveCurrency(convertCost(p.totalCostUSD)),
+      [`Saved (${code})`]: roundForActiveCurrency(convertCost(p.totalSavingsUSD)),
+      [`Avg/Session (${code})`]: p.sessions.length > 0 ? roundForActiveCurrency(convertCost(p.totalCostUSD / p.sessions.length)) : '',
       'Share (%)': pct(p.totalCostUSD, total),
       'API Calls': p.totalApiCalls,
       Sessions: p.sessions.length,
@@ -199,13 +235,14 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
         Project: p.projectPath,
         'Session ID': s.sessionId,
         'Started At': s.firstTimestamp ?? '',
-        [`Cost (${code})`]: round2(convertCost(s.totalCostUSD)),
+        [`Cost (${code})`]: roundForActiveCurrency(convertCost(s.totalCostUSD)),
+        [`Saved (${code})`]: roundForActiveCurrency(convertCost(s.totalSavingsUSD)),
         'API Calls': s.apiCalls,
         Turns: s.turns.length,
       })
     }
   }
-  return rows.sort((a, b) => (b[`Cost (${code})`] as number) - (a[`Cost (${code})`] as number))
+  return rows.sort((a, b) => ((b[`Cost (${code})`] as number) + (b[`Saved (${code})`] as number)) - ((a[`Cost (${code})`] as number) + (a[`Saved (${code})`] as number)))
 }
 
 export type PeriodExport = {
@@ -217,12 +254,14 @@ function buildSummaryRows(periods: PeriodExport[]): Row[] {
   const { code } = getCurrency()
   return periods.map(p => {
     const cost = p.projects.reduce((s, proj) => s + proj.totalCostUSD, 0)
+    const savings = p.projects.reduce((s, proj) => s + proj.totalSavingsUSD, 0)
     const calls = p.projects.reduce((s, proj) => s + proj.totalApiCalls, 0)
     const sessions = p.projects.reduce((s, proj) => s + proj.sessions.length, 0)
-    const projectCount = p.projects.filter(proj => proj.totalCostUSD > 0).length
+    const projectCount = p.projects.filter(proj => proj.totalCostUSD > 0 || proj.totalSavingsUSD > 0).length
     return {
       Period: p.label,
-      [`Cost (${code})`]: round2(convertCost(cost)),
+      [`Cost (${code})`]: roundForActiveCurrency(convertCost(cost)),
+      [`Saved (${code})`]: roundForActiveCurrency(convertCost(savings)),
       'API Calls': calls,
       Sessions: sessions,
       Projects: projectCount,
@@ -247,10 +286,11 @@ function buildReadme(periods: PeriodExport[]): string {
     '  daily.csv             Day-by-day breakdown, Period column distinguishes the window.',
     '  activity.csv          Time spent per task category (Coding, Debugging, Exploration, etc.).',
     '  models.csv            Spend per model with token totals and cache usage.',
-    '  projects.csv          Spend per project folder (30-day window).',
-    '  sessions.csv          One row per session (30-day window) with session IDs and costs.',
-    '  tools.csv             Tool invocations and share (30-day window).',
-    '  shell-commands.csv    Shell commands executed via Bash tool (30-day window).',
+    '  projects.csv          Spend per project folder for the selected detail period.',
+    '  sessions.csv          One row per session for the selected detail period.',
+    '  tools.csv             Tool invocations and share for the selected detail period.',
+    '  mcp.csv               MCP server invocations and share for the selected detail period.',
+    '  shell-commands.csv    Shell commands executed via Bash tool for the selected detail period.',
     '',
     'Notes',
     '-----',
@@ -318,6 +358,7 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
   await writeFile(join(folder, 'projects.csv'), rowsToCsv(buildProjectRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'tools.csv'), rowsToCsv(buildToolRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'mcp.csv'), rowsToCsv(buildMcpRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'shell-commands.csv'), rowsToCsv(buildBashRows(thirtyDayProjects)), 'utf-8')
 
   return folder
@@ -342,10 +383,38 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
     projects: buildProjectRows(thirtyDayProjects),
     sessions: buildSessionRows(thirtyDayProjects),
     tools: buildToolRows(thirtyDayProjects),
+    mcp: buildMcpRows(thirtyDayProjects),
     shellCommands: buildBashRows(thirtyDayProjects),
   }
 
   const target = resolve(outputPath.toLowerCase().endsWith('.json') ? outputPath : `${outputPath}.json`)
+  // Refuse to overwrite an existing file that wasn't produced by codeburn
+  // export. CSV path has the same guard via the .codeburn-export marker; JSON
+  // was missing it, so a stray `-o ~/important.json` would silently clobber.
+  const existing = await stat(target).catch(() => null)
+  if (existing?.isFile()) {
+    // Read just the first 4KB to look for the schema marker. The schema key
+    // is the first field in the JSON object so a partial read is enough;
+    // loading the whole file (potentially gigabytes) into memory could OOM
+    // on Node's ~512MB string limit.
+    const fh = await open(target, 'r')
+    try {
+      const buf = Buffer.alloc(4096)
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
+      const head = buf.toString('utf-8', 0, bytesRead)
+      if (!head.includes('"schema": "codeburn.export.v')) {
+        throw new Error(
+          `Refusing to overwrite ${target}: file does not look like a codeburn export. ` +
+          `Delete it manually or pick a different -o path.`
+        )
+      }
+    } finally {
+      await fh.close()
+    }
+  }
+  if (existing?.isDirectory()) {
+    throw new Error(`Refusing to overwrite directory at ${target}. Pass a file path instead.`)
+  }
   await mkdir(dirname(target), { recursive: true })
   await writeFile(target, JSON.stringify(data, null, 2), 'utf-8')
   return target

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from 'bun:test'
+import { describe, it, expect, afterEach } from 'vitest'
 import { mkdtemp, mkdir, cp, rm } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -11,7 +11,7 @@ import type { DateRange } from '../../src/types.js'
 const FIXTURE_DAY = Date.UTC(2026, 3, 16) // month index 3 = April (Date.UTC is 0-indexed)
 const RANGE_BEFORE_MS = FIXTURE_DAY - 24 * 60 * 60 * 1000
 const RANGE_AFTER_MS = FIXTURE_DAY + 24 * 60 * 60 * 1000
-const PROJECT_NAME = 'burnrate-poc-testing'
+const PROJECT_NAME = 'codeburn-poc-testing'
 
 function makeRange(offsetMs: number): DateRange {
   return {
@@ -28,19 +28,9 @@ function makeRange(offsetMs: number): DateRange {
 
 describe('HIGH-1 prototype pollution via unchecked bracket-assign', () => {
   const tmpDirs: string[] = []
-  let originalConfigDir: string | undefined
-
-  beforeEach(() => {
-    originalConfigDir = process.env['CLAUDE_CONFIG_DIR']
-  })
 
   afterEach(async () => {
     delete (Object.prototype as Record<string, unknown>).calls
-    if (originalConfigDir === undefined) {
-      delete process.env['CLAUDE_CONFIG_DIR']
-    } else {
-      process.env['CLAUDE_CONFIG_DIR'] = originalConfigDir
-    }
     while (tmpDirs.length > 0) {
       const d = tmpDirs.pop()
       if (d) await rm(d, { recursive: true, force: true })
@@ -48,7 +38,7 @@ describe('HIGH-1 prototype pollution via unchecked bracket-assign', () => {
   })
 
   async function setupPoc(fixture: string): Promise<string> {
-    const base = await mkdtemp(join(tmpdir(), 'burnrate-sec-'))
+    const base = await mkdtemp(join(tmpdir(), 'codeburn-sec-'))
     tmpDirs.push(base)
     const projectDir = join(base, 'projects', PROJECT_NAME)
     await mkdir(projectDir, { recursive: true })
@@ -59,19 +49,19 @@ describe('HIGH-1 prototype pollution via unchecked bracket-assign', () => {
 
   it('does not pollute Object.prototype when session contains tool_use name "__proto__"', async () => {
     await setupPoc('proto-tool.jsonl')
-    await parseAllSessions(makeRange(0), 'claude')
+    await expect(parseAllSessions(makeRange(0), 'claude')).resolves.not.toThrow()
     expect(({} as Record<string, unknown>).calls).toBeUndefined()
   })
 
   it('does not pollute Object.prototype when bash command basename is "__proto__"', async () => {
     await setupPoc('proto-bash.jsonl')
-    await parseAllSessions(makeRange(1), 'claude')
+    await expect(parseAllSessions(makeRange(1), 'claude')).resolves.not.toThrow()
     expect(({} as Record<string, unknown>).calls).toBeUndefined()
   })
 
   it('does not pollute Object.prototype when model name is "__proto__"', async () => {
     await setupPoc('proto-model.jsonl')
-    await parseAllSessions(makeRange(2), 'claude')
+    await expect(parseAllSessions(makeRange(2), 'claude')).resolves.not.toThrow()
     expect(({} as Record<string, unknown>).calls).toBeUndefined()
   })
 })

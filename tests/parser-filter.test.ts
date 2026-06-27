@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 
 import { filterProjectsByName } from '../src/parser.js'
 import type { ProjectSummary } from '../src/types.js'

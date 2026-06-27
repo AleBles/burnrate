@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 
 function runCli(args: string[], home: string) {
-  return spawnSync(process.execPath, ['src/cli.ts', ...args], {
+  return spawnSync('bun', ['src/cli.ts', ...args], {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -24,18 +24,21 @@ describe('burnrate plan command', () => {
       const setResult = runCli(['plan', 'set', 'claude-max'], home)
       expect(setResult.status).toBe(0)
 
+      // Plans are stored provider-keyed under `plans`; the claude-max preset is
+      // scoped to the 'claude' provider. The legacy singular `plan` is removed.
       const configPath = join(home, '.config', 'burnrate', 'config.json')
       const configRaw = await readFile(configPath, 'utf-8')
-      const config = JSON.parse(configRaw) as { plan?: { id?: string; monthlyUsd?: number } }
-      expect(config.plan?.id).toBe('claude-max')
-      expect(config.plan?.monthlyUsd).toBe(200)
+      const config = JSON.parse(configRaw) as { plans?: { claude?: { id?: string; monthlyUsd?: number } } }
+      expect(config.plans?.claude?.id).toBe('claude-max')
+      expect(config.plans?.claude?.monthlyUsd).toBe(200)
 
       const resetResult = runCli(['plan', 'reset'], home)
       expect(resetResult.status).toBe(0)
 
       const afterResetRaw = await readFile(configPath, 'utf-8')
-      const afterReset = JSON.parse(afterResetRaw) as { plan?: unknown }
+      const afterReset = JSON.parse(afterResetRaw) as { plan?: unknown; plans?: unknown }
       expect(afterReset.plan).toBeUndefined()
+      expect(afterReset.plans).toBeUndefined()
     } finally {
       await rm(home, { recursive: true, force: true })
     }

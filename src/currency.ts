@@ -3,6 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import { readConfig } from './config.js'
+import { fetchWithTimeout } from './fetch-utils.js'
 
 type CurrencyState = {
   code: string
@@ -27,6 +28,9 @@ function isValidRate(value: unknown): value is number {
 let active: CurrencyState = { code: 'USD', rate: 1, symbol: '$' }
 
 const USD: CurrencyState = { code: 'USD', rate: 1, symbol: '$' }
+const SYMBOL_OVERRIDES: Record<string, string> = {
+  CNY: '¥',
+}
 
 // Intl.NumberFormat throws on invalid ISO 4217 codes, so we use it as a validator
 export function isValidCurrencyCode(code: string): boolean {
@@ -39,6 +43,8 @@ export function isValidCurrencyCode(code: string): boolean {
 }
 
 function resolveSymbol(code: string): string {
+  if (SYMBOL_OVERRIDES[code]) return SYMBOL_OVERRIDES[code]
+
   const parts = new Intl.NumberFormat('en', {
     style: 'currency',
     currency: code,
@@ -47,11 +53,22 @@ function resolveSymbol(code: string): string {
   return parts.find(p => p.type === 'currency')?.value ?? code
 }
 
-function getFractionDigits(code: string): number {
+export function getFractionDigits(code: string): number {
   return new Intl.NumberFormat('en', {
     style: 'currency',
     currency: code,
   }).resolvedOptions().maximumFractionDigits ?? 2
+}
+
+/// Round a converted cost to the currency's natural decimal places. JPY/KRW/CLP
+/// resolve to 0 fraction digits — exporting those with `round2` produced rows
+/// like `¥412.37` while the dashboard rendered `¥412`, breaking finance reports
+/// that compare the two surfaces.
+export function roundForActiveCurrency(value: number): number {
+  const code = getCurrency().code
+  const digits = getFractionDigits(code)
+  const factor = Math.pow(10, digits)
+  return Math.round(value * factor) / factor
 }
 
 function getCacheDir(): string {
@@ -63,7 +80,9 @@ function getRateCachePath(): string {
 }
 
 async function fetchRate(code: string): Promise<number> {
-  const response = await fetch(`${FRANKFURTER_URL}${code}`)
+  // Bounded so a stalled network can't hang the daily refresh for non-USD users
+  // (same wedge as the pricing fetch); callers fall back to USD / cached rate.
+  const response = await fetchWithTimeout(`${FRANKFURTER_URL}${code}`)
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const data = await response.json() as { rates?: Record<string, unknown> }
   const rate = data.rates?.[code]
@@ -98,13 +117,19 @@ async function getExchangeRate(code: string): Promise<number> {
   const cached = await loadCachedRate(code)
   if (cached) return cached
 
+  let rate: number
   try {
-    const rate = await fetchRate(code)
-    await cacheRate(code, rate)
-    return rate
+    rate = await fetchRate(code)
   } catch {
     return 1
   }
+  // Persist the rate, but never let a cache-write failure (disk full, no
+  // permissions, etc.) cause us to return the USD-equivalent fallback.
+  // The original code wrapped fetch + cacheRate in one try/catch, so a
+  // disk-full at write time would discard a perfectly good rate and silently
+  // make every cost render as if the user had selected USD.
+  cacheRate(code, rate).catch(() => {})
+  return rate
 }
 
 export async function loadCurrency(): Promise<void> {
@@ -137,9 +162,13 @@ export function getCostColumnHeader(): string {
 }
 
 export function convertCost(costUSD: number): number {
-  const digits = getFractionDigits(active.code)
-  const factor = 10 ** digits
-  return Math.round(costUSD * active.rate * factor) / factor
+  // Return the unrounded converted cost. Rounding here meant zero-fraction
+  // currencies (JPY, KRW, CLP) clamped every per-session cost to the nearest
+  // whole unit before aggregation; a project with 1000 sessions averaging
+  // ¥0.4 each would aggregate to ¥0 instead of ¥400 because each row was
+  // rounded independently. formatCost (and the export rowsToCsv path) round
+  // at the display boundary instead.
+  return costUSD * active.rate
 }
 
 export function formatCost(costUSD: number): string {
@@ -151,5 +180,6 @@ export function formatCost(costUSD: number): string {
 
   if (cost >= 1) return `${symbol}${cost.toFixed(2)}`
   if (cost >= 0.01) return `${symbol}${cost.toFixed(3)}`
-  return `${symbol}${cost.toFixed(4)}`
+  if (cost >= 0.0001) return `${symbol}${cost.toFixed(4)}`
+  return `${symbol}${cost.toFixed(2)}`
 }

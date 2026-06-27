@@ -13,7 +13,7 @@
   "scripts": {
     "dev": "bun src/cli.ts",
     "build:binary": "bun run build.ts --compile",
-    "test": "bun test"
+    "test": "vitest run"
   },
   "keywords": [
     "claude-code",
@@ -44,11 +44,14 @@
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "ink": "^7.0.0",
-    "react": "^19.2.5"
+    "react": "^19.2.5",
+    "strip-ansi": "^7.2.0"
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",
+    "@types/node": "^22.19.17",
     "@types/react": "^19.2.14",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
   }
 }
