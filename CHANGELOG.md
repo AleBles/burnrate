@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **3-column dashboard layout** on wide terminals (≥160 cols). The dash now scales 1 → 2 → 3 panels per row and uses the full terminal width in triple mode (no longer capped at 160).
+- **Removed `overhead` column** from the project breakdown panel; the per-project context-budget probe is gone with it.
+
 ## 0.1.0 — Initial fork
 
 Forked from [agentseal/codeburn](https://github.com/getagentseal/codeburn) at commit `8950552`.
