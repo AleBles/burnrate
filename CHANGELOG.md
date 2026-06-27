@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Instant period/provider switching in the dashboard.** Each `(provider, period)` view is cached after its first load; switching now renders the cached data immediately and refreshes in the background (debounced ~600ms for arrow-key navigation), with an unobtrusive `↻ updating…` hint in the status bar. The full-screen "Loading…" panel only appears on a genuine cache miss (first visit to a view).
 - **Synced with upstream codeburn** (`dbde5cb`..`codeburn/main`, ~380 commits) while keeping burnrate lean:
   - **New agent providers**: warp, goose, grok, qwen, droid, kimi, mistral-vibe, roo-code, cline, kilo-code, codebuff, devin, ibm-bob, crush, forge, hermes, zcode, zerostack, antigravity, mux, vercel-gateway, and more.
   - **Rewritten pricing engine** (bundled LiteLLM snapshot + gap-fill fallback), parser fixes, and perf/infra improvements.

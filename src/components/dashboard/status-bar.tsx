@@ -3,7 +3,7 @@ import { Box, Text } from 'ink'
 
 import { DIM, ORANGE } from './constants.js'
 
-export function StatusBar({ width, showProvider }: { width: number; showProvider?: boolean }) {
+export function StatusBar({ width, showProvider, refreshing }: { width: number; showProvider?: boolean; refreshing?: boolean }) {
   return (
     <Box borderStyle="round" borderColor={DIM} width={width} flexDirection="column" alignItems="center" paddingX={1}>
       <Text>
@@ -16,6 +16,7 @@ export function StatusBar({ width, showProvider }: { width: number; showProvider
         <Text color={ORANGE} bold>4</Text><Text dimColor> month   </Text>
         <Text color={ORANGE} bold>5</Text><Text dimColor> all time</Text>
         {showProvider && (<><Text dimColor>   </Text><Text color={ORANGE} bold>p</Text><Text dimColor> provider</Text></>)}
+        {refreshing && (<Text dimColor>   ↻ updating…</Text>)}
       </Text>
     </Box>
   )
