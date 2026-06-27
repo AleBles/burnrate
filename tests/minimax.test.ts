@@ -1,12 +1,17 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, beforeEach } from 'bun:test'
 
-import { getModelCosts, getShortModelName } from '../src/models.js'
+import { getModelCosts, getShortModelName, resetPricingCache } from '../src/models.js'
 
 // Verifies MiniMax pricing loaded from FALLBACK_PRICING (no network call).
-// pricingCache stays null until loadPricing() runs, so getModelCosts falls
-// through to FALLBACK_PRICING which is what we want to validate here.
+// pricingCache is module-level state shared across the whole `bun test` run, so
+// another test file calling loadPricing() leaks upstream pricing in here. Reset
+// it before each test so getModelCosts falls through to FALLBACK_PRICING, which
+// is what we want to validate.
 
 describe('MiniMax model pricing', () => {
+  beforeEach(() => resetPricingCache())
+
+
   it('returns pricing for MiniMax-M2.7', () => {
     const costs = getModelCosts('MiniMax-M2.7')
     expect(costs).not.toBeNull()

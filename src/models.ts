@@ -129,6 +129,13 @@ export async function loadPricing(): Promise<void> {
   }
 }
 
+// Test seam: drop any loaded upstream pricing so getModelCosts falls back to
+// FALLBACK_PRICING. pricingCache is module-level state shared across the whole
+// `bun test` run, so a test that asserts fallback behavior must reset it.
+export function resetPricingCache(): void {
+  pricingCache = null
+}
+
 // Known model name variants that providers emit but LiteLLM/fallback don't index under.
 // OMP emits 'anthropic--claude-4.6-opus' (double-dash, dot version, tier-last).
 // getCanonicalName strips any 'provider/' prefix first, so only the post-strip
