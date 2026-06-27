@@ -8,6 +8,7 @@ import { renderStatusBar } from './format.js'
 import { dateKey } from './day-aggregator.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { renderDashboard } from './dashboard.js'
+import { renderOverview } from './overview.js'
 import { parseDateRangeFlags } from './cli-date.js'
 import { clearPlan, readConfig, readPlan, saveConfig, savePlan, getConfigFilePath, type PlanId } from './config.js'
 import { clampResetDay, getPlanUsageOrNull, type PlanUsage } from './plan-usage.js'
@@ -674,6 +675,88 @@ program
     console.log(`  Provider: ${preset.provider}`)
     console.log(`  Reset day: ${resetDay}`)
     console.log(`  Config saved to ${getConfigFilePath()}\n`)
+  })
+
+program
+  .command('overview')
+  .description('Plain-text usage overview, copy-pasteable (defaults to this month)')
+  .option('-p, --period <period>', 'Period: today, week, 30days, month, all', 'month')
+  .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
+  .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
+  .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, copilot)', 'all')
+  .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
+  .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
+  .option('--no-color', 'Disable ANSI colors')
+  .action(async (opts) => {
+    await loadPricing()
+    let customRange: DateRange | null = null
+    try {
+      customRange = parseDateRangeFlags(opts.from, opts.to)
+    } catch (err) {
+      console.error(`\n  Error: ${err instanceof Error ? err.message : String(err)}\n`)
+      process.exit(1)
+    }
+    const { range, label } = customRange
+      ? { range: customRange, label: `${opts.from ?? 'all'} to ${opts.to ?? 'today'}` }
+      : getDateRange(toPeriod(opts.period))
+    const projects = filterProjectsByName(await parseAllSessions(range, opts.provider), opts.project, opts.exclude)
+    process.stdout.write(renderOverview(projects, { label, color: opts.color }))
+  })
+
+program
+  .command('models')
+  .description('Per-model token + cost table, optionally exploded by task type')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
+  .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
+  .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--task <category>', 'Filter to one task type (e.g. feature, debugging, refactoring)')
+  .option('--by-task', 'One row per (provider, model, task) instead of one row per (provider, model)')
+  .option('--top <n>', 'Show only the top N rows', (v: string) => parseInt(v, 10))
+  .option('--min-cost <usd>', 'Hide rows below this cost threshold', (v: string) => parseFloat(v))
+  .option('--no-totals', 'Suppress the footer totals row')
+  .option('--format <format>', 'Output format: table, markdown, json, csv', 'table')
+  .action(async (opts) => {
+    const { aggregateModels, renderTable, renderMarkdown, renderJson, renderCsv } = await import('./models-report.js')
+    await loadPricing()
+
+    let range: DateRange
+    if (opts.from || opts.to) {
+      const customRange = parseDateRangeFlags(opts.from, opts.to)
+      if (!customRange) {
+        process.stderr.write('burnrate: --from and --to must be valid YYYY-MM-DD dates\n')
+        process.exit(1)
+      }
+      range = customRange
+    } else {
+      range = getDateRange(opts.period).range
+    }
+
+    const projects = await parseAllSessions(range, opts.provider)
+    const rows = await aggregateModels(projects, {
+      byTask: !!opts.byTask,
+      taskFilter: opts.task,
+      topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
+      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : 0.01,
+    })
+
+    const fmt = (opts.format ?? 'table').toLowerCase()
+    if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {
+      process.stdout.write('No model usage found for the selected period.\n')
+      return
+    }
+    if (fmt === 'json') {
+      process.stdout.write(renderJson(rows) + '\n')
+    } else if (fmt === 'csv') {
+      process.stdout.write(renderCsv(rows, { byTask: !!opts.byTask }) + '\n')
+    } else if (fmt === 'markdown' || fmt === 'md') {
+      process.stdout.write(renderMarkdown(rows, { byTask: !!opts.byTask, showTotals: opts.totals !== false }) + '\n')
+    } else if (fmt === 'table') {
+      process.stdout.write(renderTable(rows, { byTask: !!opts.byTask, showTotals: opts.totals !== false }) + '\n')
+    } else {
+      process.stderr.write(`burnrate: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
+      process.exit(1)
+    }
   })
 
 program.parse()

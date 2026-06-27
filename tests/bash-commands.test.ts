@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { extractBashCommands } from '../src/bash-utils.js'
 import { BASH_TOOLS } from '../src/classifier.js'
 

@@ -1,8 +1,10 @@
-import { readdir, readFile, stat } from 'fs/promises'
+import { readdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { readSessionFile } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
+import { extractBashCommands } from '../bash-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const toolNameMap: Record<string, string> = {
@@ -65,103 +67,143 @@ type GeminiSession = {
 function parseSession(data: GeminiSession, seenKeys: Set<string>): ParsedProviderCall[] {
   const results: ParsedProviderCall[] = []
 
-  const geminiMessages = data.messages.filter(m => m.type === 'gemini' && m.tokens && m.model)
-  if (geminiMessages.length === 0) return results
+  let lastUserMessage = ''
+  let turnOrdinal = 0
+  let currentTurnId = `${data.sessionId}:prelude`
+  let geminiOrdinal = 0
 
-  const dedupKey = `gemini:${data.sessionId}`
-  if (seenKeys.has(dedupKey)) return results
-  seenKeys.add(dedupKey)
+  for (const msg of data.messages) {
+    if (msg.type === 'user') {
+      if (Array.isArray(msg.content)) {
+        lastUserMessage = msg.content.map(c => c.text).join(' ').slice(0, 500)
+      } else if (typeof msg.content === 'string') {
+        lastUserMessage = msg.content.slice(0, 500)
+      }
+      currentTurnId = `${data.sessionId}:turn-${turnOrdinal++}`
+      continue
+    }
 
-  let totalInput = 0
-  let totalOutput = 0
-  let totalCached = 0
-  let totalThoughts = 0
-  const allTools: string[] = []
-  const bashCommands: string[] = []
-  let model = ''
+    if (msg.type !== 'gemini' || !msg.tokens || !msg.model) continue
 
-  for (const msg of geminiMessages) {
-    const t = msg.tokens!
-    totalInput += t.input ?? 0
-    totalOutput += (t.output ?? 0) + (t.thoughts ?? 0)
-    totalCached += t.cached ?? 0
-    totalThoughts += t.thoughts ?? 0
-    if (msg.model && !model) model = msg.model
+    const t = msg.tokens
+    const totalInput = t.input ?? 0
+    const totalOutput = t.output ?? 0
+    const totalCached = t.cached ?? 0
+    const totalThoughts = t.thoughts ?? 0
+    if (totalInput === 0 && totalOutput === 0 && totalCached === 0 && totalThoughts === 0) continue
+
+    const messageKey = msg.id || `idx-${geminiOrdinal}`
+    geminiOrdinal++
+    const dedupKey = `gemini:${data.sessionId}:${messageKey}`
+    if (seenKeys.has(dedupKey)) continue
+
+    const tools: string[] = []
+    const bashCommands: string[] = []
 
     if (msg.toolCalls) {
       for (const tc of msg.toolCalls) {
         const mapped = toolNameMap[tc.displayName ?? ''] ?? toolNameMap[tc.name] ?? tc.displayName ?? tc.name
-        allTools.push(mapped)
+        tools.push(mapped)
         if (mapped === 'Bash' && tc.args && typeof tc.args.command === 'string') {
-          const cmd = tc.args.command.split(/\s+/)[0] ?? ''
-          if (cmd) bashCommands.push(cmd)
+          bashCommands.push(...extractBashCommands(tc.args.command))
         }
       }
     }
+
+    // Gemini's `input` count includes `cached` tokens as a subset, so fresh
+    // input must subtract cached to avoid double-charging at both rates.
+    const freshInput = Math.max(0, totalInput - totalCached)
+
+    const tsDate = new Date(msg.timestamp || data.startTime)
+    if (isNaN(tsDate.getTime()) || tsDate.getTime() < 1_000_000_000_000) continue
+
+    seenKeys.add(dedupKey)
+
+    // Gemini bills thoughts at the output token rate; calculateCost does not
+    // accept a reasoning parameter, so fold thoughts into the output count for
+    // pricing while keeping outputTokens / reasoningTokens reported separately.
+    const costUSD = calculateCost(msg.model, freshInput, totalOutput + totalThoughts, 0, totalCached, 0)
+
+    results.push({
+      provider: 'gemini',
+      model: msg.model,
+      inputTokens: freshInput,
+      outputTokens: totalOutput,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: totalCached,
+      cachedInputTokens: totalCached,
+      reasoningTokens: totalThoughts,
+      webSearchRequests: 0,
+      costUSD,
+      tools: [...new Set(tools)],
+      bashCommands: [...new Set(bashCommands)],
+      timestamp: tsDate.toISOString(),
+      speed: 'standard',
+      deduplicationKey: dedupKey,
+      turnId: currentTurnId,
+      userMessage: lastUserMessage,
+      sessionId: data.sessionId,
+    })
   }
 
-  if (totalInput === 0 && totalOutput === 0) return results
+  return results
+}
 
-  // Gemini's `input` count includes `cached` tokens as a subset, so fresh input
-  // must subtract cached to avoid double-charging at both rates.
-  const freshInput = totalInput - totalCached
+function parseJsonl(raw: string): GeminiSession | null {
+  const lines = raw.split('\n').filter(l => l.trim())
+  if (lines.length === 0) return null
 
-  let userMessage = ''
-  const firstUser = data.messages.find(m => m.type === 'user')
-  if (firstUser) {
-    if (Array.isArray(firstUser.content)) {
-      userMessage = firstUser.content.map(c => c.text).join(' ').slice(0, 500)
-    } else if (typeof firstUser.content === 'string') {
-      userMessage = firstUser.content.slice(0, 500)
+  let sessionId = ''
+  let startTime = ''
+  let projectHash: string | undefined
+  let lastUpdated: string | undefined
+  let kind: string | undefined
+  const messages: GeminiMessage[] = []
+
+  for (const line of lines) {
+    let obj: Record<string, unknown>
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (obj['$set'] !== undefined) continue
+    if (obj['sessionId'] && obj['startTime'] && !sessionId) {
+      sessionId = obj['sessionId'] as string
+      startTime = obj['startTime'] as string
+      projectHash = obj['projectHash'] as string | undefined
+      lastUpdated = obj['lastUpdated'] as string | undefined
+      kind = obj['kind'] as string | undefined
+    } else if (obj['id'] && obj['type']) {
+      messages.push(obj as unknown as GeminiMessage)
     }
   }
 
-  const tsDate = new Date(data.startTime)
-  if (isNaN(tsDate.getTime()) || tsDate.getTime() < 1_000_000_000_000) return results
-
-  const costUSD = calculateCost(model, freshInput, totalOutput, 0, totalCached, 0)
-
-  results.push({
-    provider: 'gemini',
-    model,
-    inputTokens: freshInput,
-    outputTokens: totalOutput,
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: totalCached,
-    cachedInputTokens: totalCached,
-    reasoningTokens: totalThoughts,
-    webSearchRequests: 0,
-    costUSD,
-    tools: [...new Set(allTools)],
-    bashCommands: [...new Set(bashCommands)],
-    timestamp: tsDate.toISOString(),
-    speed: 'standard',
-    deduplicationKey: dedupKey,
-    userMessage,
-    sessionId: data.sessionId,
-  })
-
-  return results
+  if (!sessionId) return null
+  return { sessionId, projectHash, startTime, lastUpdated, kind, messages }
 }
 
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      let raw: string
+      const raw = await readSessionFile(source.path)
+      if (raw === null) return
+
+      let data: GeminiSession | null = null
+
+      // Try single JSON first (Gemini CLI <=0.38), then JSONL (>=0.39)
       try {
-        raw = await readFile(source.path, 'utf-8')
-      } catch {
-        return
+        const parsed = JSON.parse(raw)
+        if (parsed.messages && parsed.sessionId) {
+          data = parsed
+        }
+      } catch { /* not single JSON */ }
+
+      if (!data) {
+        data = parseJsonl(raw)
       }
 
-      let data: GeminiSession
-      try {
-        data = JSON.parse(raw)
-      } catch {
-        return
-      }
-
-      if (!data.messages || !data.sessionId) return
+      if (!data?.messages || !data.sessionId) return
 
       const calls = parseSession(data, seenKeys)
       for (const call of calls) {
@@ -217,6 +259,7 @@ export function createGeminiProvider(): Provider {
       if (model === 'gemini-auto') return 'Gemini (auto)'
       const display: Record<string, string> = {
         'gemini-3-flash-preview': 'Gemini 3 Flash',
+        'gemini-3.5-flash': 'Gemini 3.5 Flash',
         'gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
         'gemini-2.5-pro': 'Gemini 2.5 Pro',
         'gemini-2.5-flash': 'Gemini 2.5 Flash',

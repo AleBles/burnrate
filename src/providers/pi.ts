@@ -5,11 +5,13 @@ import { homedir } from 'os'
 import { readSessionFile } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
+import { normalizeContentBlocks } from '../content-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const modelDisplayNames: Record<string, string> = {
   'gpt-5.4': 'GPT-5.4',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
+  'gpt-5.5': 'GPT-5.5',
   'gpt-5': 'GPT-5',
   'gpt-4o': 'GPT-4o',
   'gpt-4o-mini': 'GPT-4o Mini',
@@ -40,7 +42,7 @@ type PiEntry = {
   cwd?: string
   message?: {
     role?: string
-    content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }>
+    content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }> | string
     model?: string
     responseId?: string
     usage?: {
@@ -139,7 +141,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (!msg) continue
 
         if (msg.role === 'user') {
-          const texts = (msg.content ?? [])
+          const texts = normalizeContentBlocks(msg.content)
             .filter(c => c.type === 'text')
             .map(c => c.text ?? '')
             .filter(Boolean)
@@ -149,7 +151,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         if (msg.role !== 'assistant' || !msg.usage) continue
 
-        const { input, output, cacheRead, cacheWrite } = msg.usage
+        // Coerce undefined/null token fields to 0. Pi/OMP session files
+        // sometimes omit individual usage fields; the destructure used to
+        // pass undefined into calculateCost which then returned NaN, and
+        // that NaN propagated into every aggregate cost total.
+        const input = msg.usage.input ?? 0
+        const output = msg.usage.output ?? 0
+        const cacheRead = msg.usage.cacheRead ?? 0
+        const cacheWrite = msg.usage.cacheWrite ?? 0
         if (input === 0 && output === 0) continue
 
         const model = msg.model ?? 'gpt-5'
@@ -159,7 +168,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (seenKeys.has(dedupKey)) continue
         seenKeys.add(dedupKey)
 
-        const toolCalls = (msg.content ?? []).filter(c => c.type === 'toolCall' && c.name)
+        const toolCalls = normalizeContentBlocks(msg.content).filter(c => c.type === 'toolCall' && c.name)
         const tools = toolCalls.map(c => toolNameMap[c.name!] ?? c.name!)
         const bashCommands = toolCalls
           .filter(c => c.name === 'bash')

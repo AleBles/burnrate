@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtemp, readFile, readdir, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
-import { exportCsv, type PeriodExport } from '../src/export.js'
+import { exportCsv, exportJson, type PeriodExport } from '../src/export.js'
 import type { ProjectSummary } from '../src/types.js'
 
 let tmpDir: string
@@ -56,6 +56,7 @@ function makeProject(projectPath: string): ProjectSummary {
                 costUSD: 1.23,
                 tools: ['Read'],
                 mcpTools: [],
+                skills: [],
                 hasAgentSpawn: false,
                 hasPlanMode: false,
                 speed: 'standard',
@@ -103,6 +104,7 @@ function makeProject(projectPath: string): ProjectSummary {
           brainstorming: { turns: 0, costUSD: 0, retries: 0, editTurns: 0, oneShotTurns: 0 },
           general: { turns: 0, costUSD: 0, retries: 0, editTurns: 0, oneShotTurns: 0 },
         },
+        skillBreakdown: {},
       },
     ],
     totalCostUSD: 1.23,
@@ -150,10 +152,75 @@ describe('exportCsv', () => {
     expect(projects).toContain("'\rcmd")
   })
 
+  it('includes per-model efficiency metrics', async () => {
+    const periods: PeriodExport[] = [
+      {
+        label: '30 Days',
+        projects: [makeProject('app')],
+      },
+    ]
+
+    const outputPath = join(tmpDir, 'models.csv')
+    const folder = await exportCsv(periods, outputPath)
+    const models = await readFile(join(folder, 'models.csv'), 'utf-8')
+
+    expect(models).toContain('Edit Turns')
+    expect(models).toContain('One-shot Rate (%)')
+    expect(models).toContain('Retries/Edit')
+    expect(models).toContain('Cost/Edit')
+    expect(models).toContain(',1,100,0,')
+  })
+
   it('does not crash when periods array is empty', async () => {
     const outputPath = join(tmpDir, 'empty.csv')
     const folder = await exportCsv([], outputPath)
     const entries = await readdir(folder)
     expect(entries.length).toBeGreaterThanOrEqual(0)
+  })
+
+  it('describes detail files without hardcoding a 30-day window', async () => {
+    const periods: PeriodExport[] = [
+      {
+        label: '2026-04-07 to 2026-04-10',
+        projects: [makeProject('app')],
+      },
+    ]
+
+    const outputPath = join(tmpDir, 'custom.csv')
+    const folder = await exportCsv(periods, outputPath)
+    const readme = await readFile(join(folder, 'README.txt'), 'utf-8')
+
+    expect(readme).toContain('selected detail period')
+    expect(readme).not.toContain('30-day window')
+  })
+
+  it('writes MCP server usage to mcp.csv', async () => {
+    const project = makeProject('app')
+    project.sessions[0]!.mcpBreakdown = { node_repl: { calls: 5 } }
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const folder = await exportCsv(periods, join(tmpDir, 'mcp.csv'))
+    const mcp = await readFile(join(folder, 'mcp.csv'), 'utf-8')
+
+    expect(mcp).toContain('Server,Calls,Share (%)')
+    expect(mcp).toContain('node_repl,5,100')
+  })
+})
+
+describe('exportJson', () => {
+  it('includes an mcp section with per-server usage', async () => {
+    const project = makeProject('app')
+    project.sessions[0]!.mcpBreakdown = { node_repl: { calls: 3 }, github: { calls: 1 } }
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
+
+    const outputPath = join(tmpDir, 'export.json')
+    const saved = await exportJson(periods, outputPath)
+    const data = JSON.parse(await readFile(saved, 'utf-8'))
+
+    expect(Array.isArray(data.mcp)).toBe(true)
+    expect(data.mcp).toEqual([
+      { Server: 'node_repl', Calls: 3, 'Share (%)': 75 },
+      { Server: 'github', Calls: 1, 'Share (%)': 25 },
+    ])
   })
 })

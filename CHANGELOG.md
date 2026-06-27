@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Synced with upstream codeburn** (`dbde5cb`..`codeburn/main`, ~380 commits) while keeping burnrate lean:
+  - **New agent providers**: warp, goose, grok, qwen, droid, kimi, mistral-vibe, roo-code, cline, kilo-code, codebuff, devin, ibm-bob, crush, forge, hermes, zcode, zerostack, antigravity, mux, vercel-gateway, and more.
+  - **Rewritten pricing engine** (bundled LiteLLM snapshot + gap-fill fallback), parser fixes, and perf/infra improvements.
+  - **New report commands**: `overview` (copy-pasteable plain-text summary) and `models` (per-model token + cost table, `--by-task`, table/markdown/json/csv).
+  - **Kept removed**: macOS menubar app, GNOME extension, `optimize`, `compare`, `yield`, daily cache. **Declined**: MCP server, web dashboard / device sharing.
+  - **Test runner** migrated to vitest (requires Node 22+ for `node:sqlite`); the shipped CLI still runs on Bun (uses `bun:sqlite`).
 - **3-column dashboard layout** on wide terminals (≥160 cols). The dash now scales 1 → 2 → 3 panels per row and uses the full terminal width in triple mode (no longer capped at 160).
 - **Removed `overhead` column** from the project breakdown panel; the per-project context-budget probe is gone with it.
 
